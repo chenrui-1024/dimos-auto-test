@@ -1,0 +1,110 @@
+name: codex-auto-fix
+# Codex 自动修复 Pipeline
+# 当 CI 失败时，自动尝试修复常见问题
+
+on:
+  workflow_run:
+    workflows: ["ci", "codex-review"]
+    types: [completed]
+    branches-ignore: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  analyze-failure:
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'failure'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.event.workflow_run.head_branch }}
+
+      - name: Download failure logs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run_id = context.payload.workflow_run.id;
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: run_id
+            });
+            
+            let failedJobs = [];
+            for (const job of jobs.data.jobs) {
+              if (job.conclusion === 'failure') {
+                failedJobs.push({
+                  name: job.name,
+                  id: job.id
+                });
+              }
+            }
+            
+            console.log('Failed jobs:', JSON.stringify(failedJobs, null, 2));
+            
+            // 下载日志
+            for (const job of failedJobs) {
+              try {
+                const logs = await github.rest.actions.downloadJobLogsForWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  job_id: job.id
+                });
+                console.log(`Job ${job.name} logs downloaded`);
+              } catch (e) {
+                console.log(`Failed to download logs for ${job.name}: ${e.message}`);
+              }
+            }
+
+      - name: Attempt auto-fix
+        if: contains(github.event.workflow_run.name, 'codex-review')
+        run: |
+          echo "🔧 Analyzing failure and attempting auto-fix..."
+          
+          # 检查是否是 lint/format 问题
+          if grep -q "ruff" /tmp/failure_logs.txt 2>/dev/null || grep -q "format" /tmp/failure_logs.txt 2>/dev/null; then
+            echo "Lint/format issue detected. Attempting fix..."
+            
+            # 安装依赖
+            pip install ruff
+            
+            # 自动修复
+            ruff check --fix dimos/ tests/ scripts/ || true
+            ruff format dimos/ tests/ scripts/
+            
+            # 提交修复
+            git config user.name "codex-auto-fix[bot]"
+            git config user.email "codex-auto-fix[bot]@users.noreply.github.com"
+            git add -A
+            git diff --cached --quiet || git commit -m "style: auto-fix lint/format issues [skip ci]"
+            git push
+            
+            echo "✅ Auto-fix committed"
+          else
+            echo "⚠️ Cannot auto-fix this failure. Manual intervention required."
+          fi
+
+      - name: Post auto-fix status
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.workflow_run.pull_requests[0]?.number;
+            if (!prNumber) {
+              console.log('No PR found for this workflow run');
+              return;
+            }
+            
+            const body = context.job.status === 'success' 
+              ? '✅ **Auto-fix applied**: Lint/format issues were automatically fixed and committed.'
+              : '⚠️ **Auto-fix failed**: Could not automatically fix the issue. Please check the logs.';
+            
+            github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });

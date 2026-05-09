@@ -1,0 +1,306 @@
+name: codex-review
+# Codex 代码审查 Pipeline
+# 触发条件：PR 创建/更新、或手动触发
+# 功能：安全扫描 + 代码质量 + Hermes Review 触发
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'dimos/**'
+      - 'tests/**'
+      - 'scripts/**'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review (optional)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  # 第一层：安全扫描
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # 需要完整历史做 diff
+
+      - name: Security Scan - Secrets
+        id: secrets-scan
+        run: |
+          echo "🔍 Scanning for hardcoded secrets..."
+          
+          # 获取 PR 的 diff
+          git fetch origin ${{ github.base_ref }}:${{ github.base_ref }}
+          DIFF=$(git diff ${{ github.base_ref }}...HEAD)
+          
+          # 检查硬编码密钥
+          echo "$DIFF" | grep "^+" | grep -iE "(api_key|secret|password|token|passwd|private_key)\s*[=:]\s*['\"][^'\"]{8,}['\"]" > /tmp/secrets_found.txt || true
+          
+          if [ -s /tmp/secrets_found.txt ]; then
+            echo "❌ Hardcoded secrets detected!"
+            cat /tmp/secrets_found.txt
+            echo "secrets_found=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "✅ No hardcoded secrets found"
+            echo "secrets_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Security Scan - Dangerous Functions
+        id: danger-scan
+        run: |
+          echo "🔍 Scanning for dangerous functions..."
+          
+          git fetch origin ${{ github.base_ref }}:${{ github.base_ref }}
+          DIFF=$(git diff ${{ github.base_ref }}...HEAD)
+          
+          # Python 危险函数
+          echo "$DIFF" | grep "^+" | grep -E "\beval\(|\bexec\(|\bos\.system\(|subprocess\.call\(.*shell=True|subprocess\.run\(.*shell=True|pickle\.loads?\(" > /tmp/danger_found.txt || true
+          
+          # SQL 注入检查
+          echo "$DIFF" | grep "^+" | grep -E "execute\(f\"|\.format\(.*SELECT|\.format\(.*INSERT|\.format\(.*DELETE" >> /tmp/danger_found.txt || true
+          
+          if [ -s /tmp/danger_found.txt ]; then
+            echo "⚠️ Potentially dangerous patterns found:"
+            cat /tmp/danger_found.txt
+            echo "danger_found=true" >> "$GITHUB_OUTPUT"
+            # 不直接失败，只警告，由 reviewer 判断
+          else
+            echo "✅ No dangerous patterns found"
+            echo "danger_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post Security Results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const secretsFound = '${{ steps.secrets-scan.outputs.secrets_found }}' === 'true';
+            const dangerFound = '${{ steps.danger-scan.outputs.danger_found }}' === 'true';
+            
+            let body = '## 🔒 Security Scan Results\n\n';
+            
+            if (secretsFound) {
+              body += '❌ **FAIL**: Hardcoded secrets detected! Please use environment variables or secret management.\n';
+            } else {
+              body += '✅ **PASS**: No hardcoded secrets found.\n';
+            }
+            
+            if (dangerFound) {
+              body += '⚠️ **WARNING**: Potentially dangerous function calls found. Please review manually.\n';
+            } else {
+              body += '✅ **PASS**: No dangerous patterns found.\n';
+            }
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # 第二层：代码质量检查（快速）
+  quality-check:
+    runs-on: ubuntu-latest
+    needs: security-scan
+    if: always() && !contains(needs.*.result, 'failure')
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync --extra all --frozen
+
+      - name: Run ruff (lint)
+        id: lint
+        run: |
+          source .venv/bin/activate
+          ruff check dimos/ tests/ scripts/ --output-format=github > /tmp/lint_results.txt 2>&1 || true
+          cat /tmp/lint_results.txt
+
+      - name: Run ruff (format check)
+        id: format
+        run: |
+          source .venv/bin/activate
+          ruff format --check dimos/ tests/ scripts/ > /tmp/format_results.txt 2>&1 || true
+          cat /tmp/format_results.txt
+
+      - name: Type check (mypy)
+        id: typecheck
+        continue-on-error: true  # mypy 可能有很多历史问题，不阻塞
+        run: |
+          source .venv/bin/activate
+          mypy dimos --ignore-missing-imports > /tmp/mypy_results.txt 2>&1 || true
+          cat /tmp/mypy_results.txt
+
+      - name: Post Quality Results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let body = '## 📊 Code Quality Check\n\n';
+            
+            // Lint results
+            const lintResults = fs.readFileSync('/tmp/lint_results.txt', 'utf8');
+            const lintErrors = lintResults.split('\n').filter(line => line.includes('error')).length;
+            if (lintErrors > 0) {
+              body += `⚠️ **Lint**: ${lintErrors} issues found\n\n<details><summary>Details</summary>\n\n\`\`\`\n${lintResults}\n\`\`\`\n</details>\n\n`;
+            } else {
+              body += '✅ **Lint**: Clean\n';
+            }
+            
+            // Format results
+            const formatResults = fs.readFileSync('/tmp/format_results.txt', 'utf8');
+            if (formatResults.includes('would reformat')) {
+              body += '⚠️ **Format**: Files need formatting. Run `ruff format .`\n';
+            } else {
+              body += '✅ **Format**: Clean\n';
+            }
+            
+            body += '\n---\n*This is an automated check. Please review and fix issues before merging.*';
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # 第三层：触发 Hermes Review
+  trigger-hermes-review:
+    runs-on: ubuntu-latest
+    needs: [security-scan, quality-check]
+    if: always()
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Prepare Review Payload
+        id: prepare
+        run: |
+          # 获取 PR diff
+          git fetch origin ${{ github.base_ref }}:${{ github.base_ref }}
+          git diff ${{ github.base_ref }}...HEAD > /tmp/pr_diff.txt
+          
+          # 获取变更的文件列表
+          git diff --name-only ${{ github.base_ref }}...HEAD > /tmp/changed_files.txt
+          
+          # 统计信息
+          echo "Changed files:"
+          cat /tmp/changed_files.txt
+          echo ""
+          echo "Diff stats:"
+          git diff --stat ${{ github.base_ref }}...HEAD
+          
+          # 准备 JSON payload
+          cat > /tmp/review_payload.json << 'EOF'
+          {
+            "event": "codex_review_request",
+            "repository": "${{ github.repository }}",
+            "pr_number": ${{ github.event.number || github.event.inputs.pr_number || 'null' }},
+            "branch": "${{ github.head_ref }}",
+            "base_branch": "${{ github.base_ref }}",
+            "commit_sha": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "security_scan_status": "${{ needs.security-scan.result }}",
+            "quality_check_status": "${{ needs.quality-check.result }}",
+            "review_url": "https://github.com/${{ github.repository }}/pull/${{ github.event.number }}"
+          }
+          EOF
+          
+          echo "Payload prepared:"
+          cat /tmp/review_payload.json
+
+      - name: Trigger Hermes Review (if configured)
+        if: env.HERMES_WEBHOOK_URL != ''
+        env:
+          HERMES_WEBHOOK_URL: ${{ secrets.HERMES_WEBHOOK_URL }}
+        run: |
+          echo "🚀 Triggering Hermes Review..."
+          curl -X POST "$HERMES_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/review_payload.json \
+            --max-time 10 \
+            -v || echo "Hermes webhook not configured or unreachable"
+
+      - name: Post Review Trigger Status
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const hermesConfigured = process.env.HERMES_WEBHOOK_URL !== '';
+            
+            let body = '## 🤖 Hermes Review Status\n\n';
+            
+            if (hermesConfigured) {
+              body += '✅ Hermes Review triggered.\n';
+              body += 'A separate review agent will analyze this PR for logic errors and architecture issues.\n';
+            } else {
+              body += 'ℹ️ Hermes Review not configured.\n';
+              body += 'To enable: Set `HERMES_WEBHOOK_URL` secret in repository settings.\n';
+            }
+            
+            body += '\n---\n';
+            body += '**Pipeline Status**:\n';
+            body += '- Security Scan: ${{ needs.security-scan.result }}\n';
+            body += '- Quality Check: ${{ needs.quality-check.result }}\n';
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # 可选：Codex 自动修复
+  auto-fix:
+    runs-on: ubuntu-latest
+    needs: quality-check
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.pr_number != ''
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.CODEX_FIX_TOKEN || secrets.GITHUB_TOKEN }}
+          ref: ${{ github.head_ref }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync --extra all --frozen
+
+      - name: Auto-fix with ruff
+        run: |
+          source .venv/bin/activate
+          ruff check --fix dimos/ tests/ scripts/
+          ruff format dimos/ tests/ scripts/
+
+      - name: Commit fixes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "style: auto-fix by codex-review pipeline"
+          git push
