@@ -125,18 +125,39 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra all --frozen
 
+      - name: Resolve check paths
+        id: check-paths
+        run: |
+          paths=()
+          for path in dimos tests scripts; do
+            if [ -e "$path" ]; then
+              paths+=("$path")
+            fi
+          done
+
+          if [ ${#paths[@]} -eq 0 ]; then
+            echo "No lintable paths found"
+            exit 1
+          fi
+
+          printf '%s\n' "${paths[@]}" > /tmp/check_paths.txt
+          echo "paths=${paths[*]}" >> "$GITHUB_OUTPUT"
+          echo "Checking paths: ${paths[*]}"
+
       - name: Run ruff (lint)
         id: lint
         run: |
           source .venv/bin/activate
-          ruff check dimos/ tests/ scripts/ --output-format=github > /tmp/lint_results.txt 2>&1 || true
+          mapfile -t paths < /tmp/check_paths.txt
+          ruff check "${paths[@]}" --output-format=github > /tmp/lint_results.txt 2>&1 || true
           cat /tmp/lint_results.txt
 
       - name: Run ruff (format check)
         id: format
         run: |
           source .venv/bin/activate
-          ruff format --check dimos/ tests/ scripts/ > /tmp/format_results.txt 2>&1 || true
+          mapfile -t paths < /tmp/check_paths.txt
+          ruff format --check "${paths[@]}" > /tmp/format_results.txt 2>&1 || true
           cat /tmp/format_results.txt
 
       - name: Type check (mypy)
@@ -157,20 +178,29 @@ jobs:
             let body = '## 📊 Code Quality Check\n\n';
             
             // Lint results
-            const lintResults = fs.readFileSync('/tmp/lint_results.txt', 'utf8');
-            const lintErrors = lintResults.split('\n').filter(line => line.includes('error')).length;
-            if (lintErrors > 0) {
-              body += `⚠️ **Lint**: ${lintErrors} issues found\n\n<details><summary>Details</summary>\n\n\`\`\`\n${lintResults}\n\`\`\`\n</details>\n\n`;
-            } else {
-              body += '✅ **Lint**: Clean\n';
+            let lintResults = '';
+            try {
+              lintResults = fs.readFileSync('/tmp/lint_results.txt', 'utf8');
+              const lintErrors = lintResults.split('\n').filter(line => line.includes('error')).length;
+              if (lintErrors > 0) {
+                body += `⚠️ **Lint**: ${lintErrors} issues found\n\n<details><summary>Details</summary>\n\n\`\`\`\n${lintResults}\n\`\`\`\n</details>\n\n`;
+              } else {
+                body += '✅ **Lint**: Clean\n';
+              }
+            } catch (e) {
+              body += '⚠️ **Lint**: Could not read results\n';
             }
             
             // Format results
-            const formatResults = fs.readFileSync('/tmp/format_results.txt', 'utf8');
-            if (formatResults.includes('would reformat')) {
-              body += '⚠️ **Format**: Files need formatting. Run `ruff format .`\n';
-            } else {
-              body += '✅ **Format**: Clean\n';
+            try {
+              const formatResults = fs.readFileSync('/tmp/format_results.txt', 'utf8');
+              if (formatResults.includes('would reformat')) {
+                body += '⚠️ **Format**: Files need formatting. Run `ruff format .`\n';
+              } else {
+                body += '✅ **Format**: Clean\n';
+              }
+            } catch (e) {
+              body += '⚠️ **Format**: Could not read results\n';
             }
             
             body += '\n---\n*This is an automated check. Please review and fix issues before merging.*';
@@ -294,8 +324,14 @@ jobs:
       - name: Auto-fix with ruff
         run: |
           source .venv/bin/activate
-          ruff check --fix dimos/ tests/ scripts/
-          ruff format dimos/ tests/ scripts/
+          paths=()
+          for path in dimos tests scripts; do
+            if [ -e "$path" ]; then
+              paths+=("$path")
+            fi
+          done
+          ruff check --fix "${paths[@]}"
+          ruff format "${paths[@]}"
 
       - name: Commit fixes
         run: |

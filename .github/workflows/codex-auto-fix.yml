@@ -72,8 +72,14 @@ jobs:
             pip install ruff
             
             # 自动修复
-            ruff check --fix dimos/ tests/ scripts/ || true
-            ruff format dimos/ tests/ scripts/
+            paths=()
+            for path in dimos tests scripts; do
+              if [ -e "$path" ]; then
+                paths+=("$path")
+              fi
+            done
+            ruff check --fix "${paths[@]}" || true
+            ruff format "${paths[@]}"
             
             # 提交修复
             git config user.name "codex-auto-fix[bot]"
