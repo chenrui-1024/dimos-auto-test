@@ -1,6 +1,7 @@
 name: macos
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -38,7 +39,7 @@ jobs:
 
   checks:
     needs: [check-changes]
-    if: needs.check-changes.outputs.should-run == 'true'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, macos, arm64]
     timeout-minutes: 60
     env:

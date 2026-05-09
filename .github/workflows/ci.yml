@@ -14,11 +14,15 @@ permissions:
   packages: read
   id-token: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ci-complete:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     timeout-minutes: 60
-    runs-on: [self-hosted, Linux]
+    runs-on: ubuntu-latest
     container:
       image: ghcr.io/dimensionalos/ros-dev:dev
       env:

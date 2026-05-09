@@ -8,15 +8,15 @@ permissions:
   packages: write
   pull-requests: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pre-commit:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: [self-hosted, Linux]
+    runs-on: ubuntu-latest
     steps:
-    - name: Fix permissions
-      run: |
-        sudo chown -R $USER:$USER ${{ github.workspace }} || true
-
     - uses: actions/checkout@v5
       with:
         fetch-depth: 0
