@@ -153,3 +153,23 @@ def test_bounding_box_intersects() -> None:
         pass
 
     print("✓ All bounding box intersection tests passed!")
+
+
+def test_to_rerun_default_display_size_is_reduced() -> None:
+    """Default Rerun visualization uses smaller points without changing point data."""
+    points = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32)
+    pc = PointCloud2.from_numpy(points)
+
+    rendered = pc.to_rerun()
+
+    assert "radii=[0.012500000186264515]" in str(rendered)
+    np.testing.assert_allclose(pc.points_f32(), points)
+
+
+def test_to_rerun_explicit_voxel_size_preserves_requested_display_size() -> None:
+    """Explicit visualization sizes are still honored for callers that opt in."""
+    pc = PointCloud2.from_numpy(np.array([[0.0, 0.0, 0.0]], dtype=np.float32))
+
+    rendered = pc.to_rerun(voxel_size=0.05)
+
+    assert "radii=[0.02500000037252903]" in str(rendered)

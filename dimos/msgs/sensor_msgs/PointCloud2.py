@@ -39,6 +39,9 @@ if TYPE_CHECKING:
     from dimos.msgs.sensor_msgs.Image import Image
 
 
+DEFAULT_RERUN_VOXEL_SIZE = 0.025
+
+
 @functools.lru_cache(maxsize=16)
 def _get_matplotlib_cmap(name: str):  # type: ignore[no-untyped-def]
     """Get a matplotlib colormap by name (cached for performance)."""
@@ -652,7 +655,7 @@ class PointCloud2(Timestamped):
 
     def to_rerun(
         self,
-        voxel_size: float = 0.05,
+        voxel_size: float = DEFAULT_RERUN_VOXEL_SIZE,
         colors: list[int] | None = None,
         mode: str = "spheres",
         size: float | None = None,
