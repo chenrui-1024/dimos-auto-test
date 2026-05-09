@@ -47,7 +47,7 @@ jobs:
           sudo apt-get install -y portaudio19-dev
 
       - name: Install Python dependencies
-        run: uv sync --extra all --frozen
+        run: uv sync --all-extras --no-extra dds --no-extra unitree-dds --no-extra all --no-extra cuda --frozen
 
       - name: Remove pydrake stubs
         run: |

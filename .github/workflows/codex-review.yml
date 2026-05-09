@@ -130,7 +130,7 @@ jobs:
           echo "System dependencies installed"
 
       - name: Install dependencies
-        run: uv sync --extra all --frozen
+        run: uv sync --all-extras --no-extra dds --no-extra unitree-dds --no-extra all --no-extra cuda --frozen
 
       - name: Resolve check paths
         id: check-paths
@@ -333,7 +333,7 @@ jobs:
           echo "System dependencies installed"
 
       - name: Install dependencies
-        run: uv sync --extra all --frozen
+        run: uv sync --all-extras --no-extra dds --no-extra unitree-dds --no-extra all --no-extra cuda --frozen
 
       - name: Auto-fix with ruff
         run: |
