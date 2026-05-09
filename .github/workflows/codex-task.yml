@@ -1,0 +1,186 @@
+name: codex-task
+# Entry point for a task-driven automation loop:
+# create branch + PR, then notify an external implementation runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Task for Codex to implement"
+        required: true
+        type: string
+      base_branch:
+        description: "Base branch for the generated PR"
+        required: false
+        default: "dev"
+        type: string
+      branch_name:
+        description: "Optional branch name; defaults to codex/task-<run_id>"
+        required: false
+        type: string
+      draft:
+        description: "Create the PR as draft"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    env:
+      CODEX_TASK_WEBHOOK_URL: ${{ secrets.CODEX_TASK_WEBHOOK_URL }}
+    outputs:
+      pr-number: ${{ steps.create.outputs.pr_number }}
+      branch-name: ${{ steps.create.outputs.branch_name }}
+      pr-url: ${{ steps.create.outputs.pr_url }}
+    steps:
+      - name: Create branch and PR
+        id: create
+        uses: actions/github-script@v7
+        env:
+          TASK_INPUT: ${{ inputs.task }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          REQUESTED_BRANCH: ${{ inputs.branch_name }}
+        with:
+          script: |
+            const task = process.env.TASK_INPUT.trim();
+            const baseBranch = (process.env.BASE_BRANCH || 'dev').trim();
+            const requestedBranch = (process.env.REQUESTED_BRANCH || '').trim();
+            const runId = '${{ github.run_id }}';
+
+            const slug = task
+              .toLowerCase()
+              .replace(/[^a-z0-9._-]+/g, '-')
+              .replace(/^-+|-+$/g, '')
+              .slice(0, 48) || 'task';
+            const branchName = requestedBranch || `codex/task-${runId}-${slug}`;
+
+            const baseRef = await github.rest.git.getRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `heads/${baseBranch}`,
+            });
+
+            try {
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `refs/heads/${branchName}`,
+                sha: baseRef.data.object.sha,
+              });
+            } catch (error) {
+              if (error.status !== 422) {
+                throw error;
+              }
+              core.warning(`Branch ${branchName} already exists; reusing it.`);
+            }
+
+            const taskPath = `.github/codex/tasks/${runId}.md`;
+            const taskContent = [
+              `# Codex Task ${runId}`,
+              '',
+              `Actor: ${context.actor}`,
+              `Base branch: ${baseBranch}`,
+              '',
+              '## Task',
+              '',
+              task,
+              '',
+            ].join('\n');
+
+            let existingTaskFileSha;
+            try {
+              const existingTaskFile = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path: taskPath,
+                ref: branchName,
+              });
+              if (!Array.isArray(existingTaskFile.data)) {
+                existingTaskFileSha = existingTaskFile.data.sha;
+              }
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+            }
+
+            await github.rest.repos.createOrUpdateFileContents({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              path: taskPath,
+              message: `chore: initialize codex task ${runId}`,
+              content: Buffer.from(taskContent).toString('base64'),
+              branch: branchName,
+              sha: existingTaskFileSha,
+            });
+
+            const title = `Codex: ${task.split('\n')[0].slice(0, 80)}`;
+            const body = [
+              'Automated AI task PR.',
+              '',
+              '## Task',
+              task,
+              '',
+              '## Automation',
+              '- External runner should push implementation commits to this branch.',
+              '- Codex is the preferred primary implementation/review agent; Minimax, Kimi, Claude Code, or Hermes may assist.',
+              '- `codex-review`, `code-cleanup`, and `ci` will run after commits are pushed.',
+            ].join('\n');
+
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              head: branchName,
+              base: baseBranch,
+              body,
+              draft: ${{ inputs.draft }},
+            });
+
+            core.setOutput('pr_number', String(pr.data.number));
+            core.setOutput('branch_name', branchName);
+            core.setOutput('pr_url', pr.data.html_url);
+
+      - name: Notify implementation runner
+        if: env.CODEX_TASK_WEBHOOK_URL != ''
+        run: |
+          curl -X POST "$CODEX_TASK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d @- <<'JSON'
+          {
+            "event": "codex_task_request",
+            "repository": "${{ github.repository }}",
+            "base_branch": "${{ github.event.inputs.base_branch || 'dev' }}",
+            "branch": "${{ steps.create.outputs.branch_name }}",
+            "pr_number": ${{ steps.create.outputs.pr_number }},
+            "pr_url": "${{ steps.create.outputs.pr_url }}",
+            "task": ${{ toJSON(github.event.inputs.task) }},
+            "actor": "${{ github.actor }}"
+          }
+          JSON
+
+      - name: Post task status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const webhookConfigured = process.env.CODEX_TASK_WEBHOOK_URL !== '';
+            const body = webhookConfigured
+              ? 'Implementation runner notified. Waiting for commits on this branch.'
+              : 'PR created, but `CODEX_TASK_WEBHOOK_URL` is not configured. Run Codex manually or configure the task runner webhook.';
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number('${{ steps.create.outputs.pr_number }}'),
+              body,
+            });

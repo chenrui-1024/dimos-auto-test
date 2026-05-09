@@ -9,8 +9,14 @@ on:
     branches-ignore: [main]
 
 permissions:
+  actions: read
   contents: write
+  issues: write
   pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   analyze-failure:
@@ -19,13 +25,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.CODEX_FIX_TOKEN || secrets.GITHUB_TOKEN }}
           ref: ${{ github.event.workflow_run.head_branch }}
 
       - name: Download failure logs
+        id: logs
         uses: actions/github-script@v7
         with:
           script: |
+            const fs = require('fs');
             const run_id = context.payload.workflow_run.id;
             const jobs = await github.rest.actions.listJobsForWorkflowRun({
               owner: context.repo.owner,
@@ -44,6 +52,7 @@ jobs:
             }
             
             console.log('Failed jobs:', JSON.stringify(failedJobs, null, 2));
+            fs.writeFileSync('/tmp/failure_logs.txt', '');
             
             // 下载日志
             for (const job of failedJobs) {
@@ -53,16 +62,23 @@ jobs:
                   repo: context.repo.repo,
                   job_id: job.id
                 });
+                const content = typeof logs.data === 'string'
+                  ? logs.data
+                  : Buffer.from(logs.data).toString('utf8');
+                fs.appendFileSync('/tmp/failure_logs.txt', `\n\n===== ${job.name} (${job.id}) =====\n\n`);
+                fs.appendFileSync('/tmp/failure_logs.txt', content);
                 console.log(`Job ${job.name} logs downloaded`);
               } catch (e) {
                 console.log(`Failed to download logs for ${job.name}: ${e.message}`);
               }
             }
+            core.setOutput('failed_job_count', failedJobs.length.toString());
 
       - name: Attempt auto-fix
-        if: contains(github.event.workflow_run.name, 'codex-review')
+        id: auto-fix
         run: |
           echo "🔧 Analyzing failure and attempting auto-fix..."
+          echo "applied=false" >> "$GITHUB_OUTPUT"
           
           # 检查是否是 lint/format 问题
           if grep -q "ruff" /tmp/failure_logs.txt 2>/dev/null || grep -q "format" /tmp/failure_logs.txt 2>/dev/null; then
@@ -79,10 +95,14 @@ jobs:
             git config user.name "codex-auto-fix[bot]"
             git config user.email "codex-auto-fix[bot]@users.noreply.github.com"
             git add -A
-            git diff --cached --quiet || git commit -m "style: auto-fix lint/format issues [skip ci]"
-            git push
+            if git diff --cached --quiet; then
+              echo "No auto-fixable changes were produced."
+            else
+              git commit -m "style: auto-fix lint/format issues"
+              git push
+              echo "applied=true" >> "$GITHUB_OUTPUT"
+            fi
             
-            echo "✅ Auto-fix committed"
           else
             echo "⚠️ Cannot auto-fix this failure. Manual intervention required."
           fi
@@ -98,9 +118,10 @@ jobs:
               return;
             }
             
-            const body = context.job.status === 'success' 
+            const applied = '${{ steps.auto-fix.outputs.applied }}' === 'true';
+            const body = applied
               ? '✅ **Auto-fix applied**: Lint/format issues were automatically fixed and committed.'
-              : '⚠️ **Auto-fix failed**: Could not automatically fix the issue. Please check the logs.';
+              : '⚠️ **Auto-fix not applied**: This failure was not recognized as an auto-fixable lint/format issue, or no changes were produced.';
             
             github.rest.issues.createComment({
               issue_number: prNumber,

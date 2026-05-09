@@ -5,7 +5,7 @@ name: codex-review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'dimos/**'
       - 'tests/**'
@@ -22,13 +22,57 @@ permissions:
   pull-requests: write
   issues: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  review-context:
+    runs-on: ubuntu-latest
+    outputs:
+      pr-number: ${{ steps.context.outputs.pr_number }}
+      base-ref: ${{ steps.context.outputs.base_ref }}
+      head-ref: ${{ steps.context.outputs.head_ref }}
+      head-sha: ${{ steps.context.outputs.head_sha }}
+      review-url: ${{ steps.context.outputs.review_url }}
+    steps:
+      - name: Resolve PR context
+        id: context
+        uses: actions/github-script@v7
+        with:
+          script: |
+            let pr;
+            if (context.eventName === 'pull_request') {
+              pr = context.payload.pull_request;
+            } else {
+              const prNumber = '${{ github.event.inputs.pr_number }}';
+              if (!prNumber) {
+                core.setFailed('workflow_dispatch requires the pr_number input.');
+                return;
+              }
+              const response = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: Number(prNumber),
+              });
+              pr = response.data;
+            }
+
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('base_ref', pr.base.ref);
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('review_url', pr.html_url);
+
   # 第一层：安全扫描
   security-scan:
+    needs: review-context
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ needs.review-context.outputs.head-sha }}
           fetch-depth: 0  # 需要完整历史做 diff
 
       - name: Security Scan - Secrets
@@ -37,8 +81,8 @@ jobs:
           echo "🔍 Scanning for hardcoded secrets..."
           
           # 获取 PR 的 diff
-          git fetch origin ${{ github.base_ref }}:${{ github.base_ref }}
-          DIFF=$(git diff ${{ github.base_ref }}...HEAD)
+          git fetch origin ${{ needs.review-context.outputs.base-ref }}:${{ needs.review-context.outputs.base-ref }}
+          DIFF=$(git diff ${{ needs.review-context.outputs.base-ref }}...HEAD)
           
           # 检查硬编码密钥
           echo "$DIFF" | grep "^+" | grep -iE "(api_key|secret|password|token|passwd|private_key)\s*[=:]\s*['\"][^'\"]{8,}['\"]" > /tmp/secrets_found.txt || true
@@ -58,8 +102,8 @@ jobs:
         run: |
           echo "🔍 Scanning for dangerous functions..."
           
-          git fetch origin ${{ github.base_ref }}:${{ github.base_ref }}
-          DIFF=$(git diff ${{ github.base_ref }}...HEAD)
+          git fetch origin ${{ needs.review-context.outputs.base-ref }}:${{ needs.review-context.outputs.base-ref }}
+          DIFF=$(git diff ${{ needs.review-context.outputs.base-ref }}...HEAD)
           
           # Python 危险函数
           echo "$DIFF" | grep "^+" | grep -E "\beval\(|\bexec\(|\bos\.system\(|subprocess\.call\(.*shell=True|subprocess\.run\(.*shell=True|pickle\.loads?\(" > /tmp/danger_found.txt || true
@@ -85,7 +129,8 @@ jobs:
             const secretsFound = '${{ steps.secrets-scan.outputs.secrets_found }}' === 'true';
             const dangerFound = '${{ steps.danger-scan.outputs.danger_found }}' === 'true';
             
-            let body = '## 🔒 Security Scan Results\n\n';
+            const marker = '<!-- codex-review:security-scan -->';
+            let body = `${marker}\n## 🔒 Security Scan Results\n\n`;
             
             if (secretsFound) {
               body += '❌ **FAIL**: Hardcoded secrets detected! Please use environment variables or secret management.\n';
@@ -99,20 +144,39 @@ jobs:
               body += '✅ **PASS**: No dangerous patterns found.\n';
             }
             
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              issue_number: Number('${{ needs.review-context.outputs.pr-number }}'),
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: body
             });
+            const existing = comments.find(comment =>
+              comment.user.type === 'Bot' && comment.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                comment_id: existing.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: Number('${{ needs.review-context.outputs.pr-number }}'),
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            }
 
   # 第二层：代码质量检查（快速）
   quality-check:
     runs-on: ubuntu-latest
-    needs: security-scan
-    if: always() && !contains(needs.*.result, 'failure')
+    needs: [review-context, security-scan]
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && !contains(needs.*.result, 'failure')
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.review-context.outputs.head-sha }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -129,15 +193,23 @@ jobs:
         id: lint
         run: |
           source .venv/bin/activate
-          ruff check dimos/ tests/ scripts/ --output-format=github > /tmp/lint_results.txt 2>&1 || true
+          set +e
+          ruff check dimos/ tests/ scripts/ --output-format=github > /tmp/lint_results.txt 2>&1
+          status=$?
+          set -e
           cat /tmp/lint_results.txt
+          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
 
       - name: Run ruff (format check)
         id: format
         run: |
           source .venv/bin/activate
-          ruff format --check dimos/ tests/ scripts/ > /tmp/format_results.txt 2>&1 || true
+          set +e
+          ruff format --check dimos/ tests/ scripts/ > /tmp/format_results.txt 2>&1
+          status=$?
+          set -e
           cat /tmp/format_results.txt
+          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
 
       - name: Type check (mypy)
         id: typecheck
@@ -154,7 +226,8 @@ jobs:
           script: |
             const fs = require('fs');
             
-            let body = '## 📊 Code Quality Check\n\n';
+            const marker = '<!-- codex-review:quality-check -->';
+            let body = `${marker}\n## 📊 Code Quality Check\n\n`;
             
             // Lint results
             const lintResults = fs.readFileSync('/tmp/lint_results.txt', 'utf8');
@@ -175,53 +248,79 @@ jobs:
             
             body += '\n---\n*This is an automated check. Please review and fix issues before merging.*';
             
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              issue_number: Number('${{ needs.review-context.outputs.pr-number }}'),
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: body
             });
+            const existing = comments.find(comment =>
+              comment.user.type === 'Bot' && comment.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                comment_id: existing.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: Number('${{ needs.review-context.outputs.pr-number }}'),
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            }
+
+      - name: Fail on quality issues
+        if: steps.lint.outputs.exit_code != '0' || steps.format.outputs.exit_code != '0'
+        run: |
+          echo "Lint or format issues found. See the Code Quality Check comment for details."
+          exit 1
 
   # 第三层：触发 Hermes Review
   trigger-hermes-review:
     runs-on: ubuntu-latest
-    needs: [security-scan, quality-check]
-    if: always()
+    needs: [review-context, security-scan, quality-check]
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.review-context.result == 'success'
+    env:
+      HERMES_WEBHOOK_URL: ${{ secrets.HERMES_WEBHOOK_URL }}
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ needs.review-context.outputs.head-sha }}
           fetch-depth: 0
 
       - name: Prepare Review Payload
         id: prepare
         run: |
           # 获取 PR diff
-          git fetch origin ${{ github.base_ref }}:${{ github.base_ref }}
-          git diff ${{ github.base_ref }}...HEAD > /tmp/pr_diff.txt
+          git fetch origin ${{ needs.review-context.outputs.base-ref }}:${{ needs.review-context.outputs.base-ref }}
+          git diff ${{ needs.review-context.outputs.base-ref }}...HEAD > /tmp/pr_diff.txt
           
           # 获取变更的文件列表
-          git diff --name-only ${{ github.base_ref }}...HEAD > /tmp/changed_files.txt
+          git diff --name-only ${{ needs.review-context.outputs.base-ref }}...HEAD > /tmp/changed_files.txt
           
           # 统计信息
           echo "Changed files:"
           cat /tmp/changed_files.txt
           echo ""
           echo "Diff stats:"
-          git diff --stat ${{ github.base_ref }}...HEAD
+          git diff --stat ${{ needs.review-context.outputs.base-ref }}...HEAD
           
           # 准备 JSON payload
           cat > /tmp/review_payload.json << 'EOF'
           {
             "event": "codex_review_request",
             "repository": "${{ github.repository }}",
-            "pr_number": ${{ github.event.number || github.event.inputs.pr_number || 'null' }},
-            "branch": "${{ github.head_ref }}",
-            "base_branch": "${{ github.base_ref }}",
-            "commit_sha": "${{ github.sha }}",
+            "pr_number": ${{ needs.review-context.outputs.pr-number }},
+            "branch": "${{ needs.review-context.outputs.head-ref }}",
+            "base_branch": "${{ needs.review-context.outputs.base-ref }}",
+            "commit_sha": "${{ needs.review-context.outputs.head-sha }}",
             "actor": "${{ github.actor }}",
             "security_scan_status": "${{ needs.security-scan.result }}",
             "quality_check_status": "${{ needs.quality-check.result }}",
-            "review_url": "https://github.com/${{ github.repository }}/pull/${{ github.event.number }}"
+            "review_url": "${{ needs.review-context.outputs.review-url }}"
           }
           EOF
           
@@ -230,8 +329,6 @@ jobs:
 
       - name: Trigger Hermes Review (if configured)
         if: env.HERMES_WEBHOOK_URL != ''
-        env:
-          HERMES_WEBHOOK_URL: ${{ secrets.HERMES_WEBHOOK_URL }}
         run: |
           echo "🚀 Triggering Hermes Review..."
           curl -X POST "$HERMES_WEBHOOK_URL" \
@@ -243,11 +340,14 @@ jobs:
       - name: Post Review Trigger Status
         if: always()
         uses: actions/github-script@v7
+        env:
+          HERMES_WEBHOOK_URL: ${{ secrets.HERMES_WEBHOOK_URL }}
         with:
           script: |
             const hermesConfigured = process.env.HERMES_WEBHOOK_URL !== '';
             
-            let body = '## 🤖 Hermes Review Status\n\n';
+            const marker = '<!-- codex-review:hermes-status -->';
+            let body = `${marker}\n## 🤖 Hermes Review Status\n\n`;
             
             if (hermesConfigured) {
               body += '✅ Hermes Review triggered.\n';
@@ -262,45 +362,26 @@ jobs:
             body += '- Security Scan: ${{ needs.security-scan.result }}\n';
             body += '- Quality Check: ${{ needs.quality-check.result }}\n';
             
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              issue_number: Number('${{ needs.review-context.outputs.pr-number }}'),
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: body
             });
-
-  # 可选：Codex 自动修复
-  auto-fix:
-    runs-on: ubuntu-latest
-    needs: quality-check
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.pr_number != ''
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          token: ${{ secrets.CODEX_FIX_TOKEN || secrets.GITHUB_TOKEN }}
-          ref: ${{ github.head_ref }}
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-
-      - name: Install dependencies
-        run: uv sync --extra all --frozen
-
-      - name: Auto-fix with ruff
-        run: |
-          source .venv/bin/activate
-          ruff check --fix dimos/ tests/ scripts/
-          ruff format dimos/ tests/ scripts/
-
-      - name: Commit fixes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git diff --cached --quiet || git commit -m "style: auto-fix by codex-review pipeline"
-          git push
+            const existing = comments.find(comment =>
+              comment.user.type === 'Bot' && comment.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                comment_id: existing.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: Number('${{ needs.review-context.outputs.pr-number }}'),
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            }

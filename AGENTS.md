@@ -379,6 +379,20 @@ CI asserts the file is current — if it's stale, CI fails.
 
 ---
 
+## AI Collaboration and Review
+
+Codex is the preferred primary agent for feature work, bug fixes, local review, and PR review. Minimax, Kimi, Claude Code, or a local Hermes runner may be used as auxiliary agents for implementation, comparison, or deeper review. Do not treat one AI agent's self-review as sufficient for production changes.
+
+When reviewing with Codex, follow `docs/development/code_review.md` and prioritize:
+
+- P0: security vulnerabilities, data loss, unsafe robot behavior, secret leakage, auth bypass, broken production startup.
+- P1: correctness bugs, missing tests for changed behavior, race conditions, lifecycle leaks, performance regressions.
+- P2: maintainability issues, unclear naming, documentation gaps, non-blocking test gaps.
+
+Avoid nitpicks unless they block understanding or violate project rules. Review only issues introduced by the current diff.
+
+---
+
 ## Further Reading
 
 - Module system: `docs/usage/modules.md`

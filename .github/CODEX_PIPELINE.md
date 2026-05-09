@@ -1,16 +1,32 @@
-# Codex + GitHub Actions 自动化 Pipeline 配置指南
+# Codex + Auxiliary Agents + GitHub Actions 自动化 Pipeline 配置指南
 
 ## 概述
 
-本 Pipeline 实现三层自动化审查：
-1. **安全扫描** - 检测硬编码密钥和危险函数
-2. **代码质量** - Lint、Format、Type Check
-3. **Hermes Review** - AI 深度审查逻辑和架构
+本 Pipeline 的目标是以 Codex 为主，辅以 Minimax、Kimi、Claude Code 或本机 Hermes：
+
+1. **Codex 主实现** - 写代码、修 bug、补测试。
+2. **本地快速验证** - 运行相关测试、lint、typecheck。
+3. **Codex / Hermes 二次审查** - 重点找 correctness、安全、测试缺口、回归风险和设计问题。
+4. **GitHub Actions 完整验证** - PR 上运行 review、cleanup、CI、可选自动修复。
+5. **人工最终确认** - 生产仓库不建议让 AI 自动 merge。
+
+核心原则：
+
+- Codex 是主 agent，负责实现和 review。
+- Minimax、Kimi、Claude Code、本机 Hermes 是辅助 agent，可用于对照实现、失败修复或深度 review。
+- 不要让同一个 AI 自己写、自己审、自己合并。
+- PR 目标分支是 `dev`，`main`/`dev` 不直接推送。
 
 ## 文件结构
 
 ```
+.codex/
+└── config.toml               # Codex 本地审查默认配置
+CLAUDE.md                     # Claude Code 可选辅助实现规则
+AGENTS.md                     # Codex/agent 项目说明与审查规则
+docs/development/code_review.md # 统一审查标准
 .github/workflows/
+├── codex-task.yml            # 新增：任务入口，创建分支/PR 并通知外部实现 runner
 ├── ci.yml                    # 已有：测试 + mypy + coverage
 ├── code-cleanup.yml          # 已有：pre-commit 自动修复
 ├── codex-review.yml          # 新增：Codex 审查 Pipeline
@@ -29,9 +45,13 @@
 
 | Secret | 用途 | 必需 |
 |--------|------|------|
-| `HERMES_WEBHOOK_URL` | Hermes Review 触发地址 | 可选 |
+| `HERMES_WEBHOOK_URL` | Codex/Hermes 深度 review 触发地址 | 可选 |
+| `CODEX_TASK_WEBHOOK_URL` | 外部任务 runner 触发地址，可指向 Codex/Hermes/自建调度器 | 可选 |
+| `ANTHROPIC_API_KEY` | Claude Code 辅助 runner | 可选 |
+| `MINIMAX_API_KEY` | Minimax 辅助 runner | 可选 |
+| `KIMI_API_KEY` | Kimi 辅助 runner | 可选 |
 | `GITHUB_TOKEN` | 自动提交修复 | 自动提供 |
-| `OPENAI_API_KEY` | Codex CLI 使用 | 已有 |
+| `OPENAI_API_KEY` | Codex CLI / Codex review 使用 | 已有 |
 
 #### 设置 HERMES_WEBHOOK_URL
 
@@ -63,26 +83,59 @@ Settings -> Branches -> Add rule
 - Require conversation resolution before merging: ✅
 ```
 
-### 4. Codex CLI 使用方式
+### 4. 推荐日常流程
 
-#### 方式 A：Codex 写代码 → 自动触发 Review
+#### 方式 A：GitHub Actions 发起任务 → Codex runner 写代码 → Codex/Hermes Review/CI
+
+1. 打开 GitHub Actions → `codex-task` → `Run workflow`
+2. 输入任务描述、base branch（默认 `dev`）
+3. workflow 会自动创建 `codex/task-*` 分支和 PR
+4. 如果配置了 `CODEX_TASK_WEBHOOK_URL`，workflow 会把任务、PR 号、分支名发送给外部 runner
+5. 外部 runner 默认用 Codex 实现，也可调用 Minimax、Kimi 或 Hermes 辅助
+6. `codex-review`、`code-cleanup`、`ci` 自动运行
+
+Webhook payload 示例：
+
+```json
+{
+  "event": "codex_task_request",
+  "repository": "dimensionalOS/dimos",
+  "base_branch": "dev",
+  "branch": "codex/task-123456789-add-feature",
+  "pr_number": 123,
+  "pr_url": "https://github.com/dimensionalOS/dimos/pull/123",
+  "task": "Implement obstacle avoidance in navigation module",
+  "actor": "username"
+}
+```
+
+#### 方式 B：本地 Codex 写代码 → 本地 Codex review → GitHub PR
 
 ```bash
 # 1. 在 feature 分支上使用 Codex
 git checkout -b feat/new-feature
-codex exec --full-auto "Implement obstacle avoidance in navigation module"
+codex
 
-# 2. 推送并创建 PR
+# 2. 本地快速验证
+./bin/pytest-fast
+uv run ruff check dimos tests scripts
+uv run mypy dimos/
+
+# 3. 用 Codex review 模式做二次审查
+codex
+# 在 Codex 中运行 /review，选择 against base branch dev
+
+# 4. 推送并创建 PR
 git push -u origin feat/new-feature
 gh pr create --title "feat: obstacle avoidance" --body "..."
 
-# 3. Pipeline 自动触发
+# 5. Pipeline 自动触发
 # - 安全扫描
 # - 代码质量检查
-# - Hermes Review（如果配置了 webhook）
+# - Codex/Hermes Review（如果配置了 webhook）
 ```
 
-#### 方式 B：手动触发 Review
+#### 方式 C：手动触发 Review
 
 ```bash
 # 在已有 PR 上手动触发
@@ -95,7 +148,7 @@ PR_NUMBER=$(gh pr view --json number -q .number)
 gh workflow run codex-review -f pr_number=$PR_NUMBER
 ```
 
-### 5. Pipeline 执行流程
+### 5. PR Pipeline 执行流程
 
 ```
 PR 创建/更新
@@ -155,8 +208,8 @@ ruff check dimos/ tests/ scripts/
 # 运行 format 检查
 ruff format --check dimos/ tests/ scripts/
 
-# 运行测试
-pytest --tb=no -q
+# 运行快速测试
+./bin/pytest-fast
 ```
 
 ## 故障排除

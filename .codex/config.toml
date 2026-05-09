@@ -1,0 +1,18 @@
+# Local defaults for Codex CLI / editor integrations in this repository.
+# Keep review runs conservative: Codex is the second reviewer, not the implementation agent.
+
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[review]
+base_branch = "dev"
+standard = "docs/development/code_review.md"
+focus = [
+  "correctness",
+  "robotics safety",
+  "security",
+  "missing tests",
+  "concurrency",
+  "module lifecycle",
+  "performance regressions",
+]
